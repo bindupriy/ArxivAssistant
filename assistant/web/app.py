@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from typing import Annotated, Iterator, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -25,19 +26,24 @@ from assistant.memory.conversations import (
 )
 from assistant.memory.criteria_store import get_active
 from assistant.memory.curation_store import (
+    base_arxiv_id,
     get_decision,
     list_decisions,
     set_decision_status,
 )
 from assistant.memory.episodic import set_feedback
 from assistant.rag.ingest import ingest_source
+from assistant.rag.arxiv_fetch import search_papers as search_arxiv_papers
+from assistant.rag.filters import MetadataFilters
 from assistant.rag.retriever import invalidate_bm25_cache
-from assistant.storage import Chunk, Domain, Paper, session_scope
+from assistant.storage import Chunk, Domain, Paper, get_engine, session_scope
 from assistant.storage.domains import sync_domains_from_config
 from assistant.storage.qdrant_store import delete_paper_vectors
+from assistant.storage.index_lock import index_lock, paper_lock, resource_lock
 from assistant.web.runner import invoke_graph, jobs, stream_graph
 
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+log = logging.getLogger(__name__)
 ReadingStatus = Literal["new", "reviewing", "read"]
 
 
@@ -49,6 +55,7 @@ class ConversationCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     message: str
+    filters: MetadataFilters = Field(default_factory=MetadataFilters)
 
 
 class FeedbackUpdate(BaseModel):
@@ -87,8 +94,12 @@ def _citation_details(chunk_ids: list[str]) -> list[dict]:
             "arxiv_id": paper.arxiv_id,
             "section": chunk.section_title or chunk.section_type,
             "text": chunk.text,
+            "page_number": chunk.page_number,
             "arxiv_url": f"https://arxiv.org/abs/{paper.arxiv_id}" if paper.arxiv_id else None,
-            "pdf_url": f"/api/papers/{paper.id}/pdf" if paper.pdf_path else None,
+            "pdf_url": (
+                f"/api/papers/{paper.id}/pdf"
+                + (f"#page={chunk.page_number}" if chunk.page_number else "")
+            ) if paper.pdf_path else None,
         }
         for chunk, paper in rows
     }
@@ -131,6 +142,8 @@ def _scope_state(conversation: dict) -> dict:
 
 
 def create_app() -> FastAPI:
+    # Finish schema setup before concurrent requests can race on first access.
+    get_engine()
     app = FastAPI(title="AI Research Assistant", docs_url="/api/docs")
     app.add_middleware(
         TrustedHostMiddleware,
@@ -166,6 +179,24 @@ def create_app() -> FastAPI:
     @app.get("/api/jobs")
     def api_jobs() -> list[dict]:
         return jobs.list()
+
+    @app.get("/api/arxiv/search")
+    def api_search_arxiv(q: Annotated[str, Query(min_length=2, max_length=160)]) -> list[dict]:
+        try:
+            matches = search_arxiv_papers(q)
+        except Exception as exc:
+            log.warning("arXiv search failed", exc_info=True)
+            raise HTTPException(status_code=502, detail="arXiv search unavailable; try again shortly") from exc
+        if not matches:
+            return []
+        with session_scope() as session:
+            indexed = {
+                base_arxiv_id(arxiv_id): paper_id
+                for paper_id, arxiv_id in session.execute(select(Paper.id, Paper.arxiv_id))
+                if arxiv_id
+            }
+        return [{**match, "paper_id": indexed.get(base_arxiv_id(match["arxiv_id"]))}
+                for match in matches]
 
     @app.get("/api/papers")
     def api_papers(
@@ -232,13 +263,14 @@ def create_app() -> FastAPI:
 
     @app.delete("/api/papers/{paper_id}", status_code=204)
     def api_delete_paper(paper_id: str) -> Response:
-        with session_scope() as session:
-            paper = session.get(Paper, paper_id)
-            if paper is None:
-                raise HTTPException(status_code=404, detail="Paper not found")
-            delete_paper_vectors(paper_id)
-            session.delete(paper)
-        invalidate_bm25_cache()
+        with paper_lock(paper_id), index_lock.write():
+            with session_scope() as session:
+                paper = session.get(Paper, paper_id)
+                if paper is None:
+                    raise HTTPException(status_code=404, detail="Paper not found")
+                delete_paper_vectors(paper_id)
+                session.delete(paper)
+            invalidate_bm25_cache()
         return Response(status_code=204)
 
     @app.get("/api/papers/{paper_id}/pdf")
@@ -361,10 +393,15 @@ def create_app() -> FastAPI:
     @app.post("/api/topics/{domain}/monitor", status_code=202)
     def api_monitor(domain: str) -> dict:
         sync_domains_from_config()
+
+        def monitor() -> dict:
+            with resource_lock(f"monitor:{domain}"):
+                return invoke_graph({"intent": "monitor_tick", "domain": domain})
+
         return jobs.submit(
             "monitor",
             domain,
-            lambda: invoke_graph({"intent": "monitor_tick", "domain": domain}),
+            monitor,
         )
 
     @app.get("/api/inbox")
@@ -449,31 +486,38 @@ def create_app() -> FastAPI:
         question = body.message.strip()
         if not question:
             raise HTTPException(status_code=400, detail="Message cannot be empty")
-        history = conversation_history(conversation_id, get_config().rag.history_turns)
-        state = {
-            "intent": "ask",
-            "question": question,
-            "conversation_id": conversation_id,
-            "scratch": {"history": history},
-            **_scope_state(conversation),
-        }
 
         def output() -> Iterator[str]:
-            yield json.dumps({"type": "conversation", "conversation": conversation}) + "\n"
-            for line in stream_graph(state):
-                event = json.loads(line)
-                if event.get("type") == "final":
-                    result = event.get("result") or {}
-                    result["sources"] = _citation_details(list(result.get("citations") or []))
-                    result["interaction_id"] = (result.get("scratch") or {}).get(
-                        "interaction_id"
-                    )
-                    event["result"] = result
-                yield json.dumps(event, ensure_ascii=True) + "\n"
-                if event.get("type") == "final":
-                    renamed = generate_conversation_title(conversation_id, question)
-                    if renamed is not None:
-                        yield json.dumps({"type": "conversation", "conversation": renamed}) + "\n"
+            # A conversation's next turn must load history after its prior turn completes.
+            # Different conversations still stream concurrently.
+            with resource_lock(f"conversation:{conversation_id}"):
+                current = get_conversation(conversation_id)
+                if current is None:
+                    yield json.dumps({"type": "error", "message": "Conversation not found"}) + "\n"
+                    return
+                history = conversation_history(conversation_id, get_config().rag.history_turns)
+                state = {
+                    "intent": "ask",
+                    "question": question,
+                    "conversation_id": conversation_id,
+                    "scratch": {"history": history, "metadata_filters": body.filters.model_dump(exclude_defaults=True)},
+                    **_scope_state(current),
+                }
+                yield json.dumps({"type": "conversation", "conversation": current}) + "\n"
+                for line in stream_graph(state):
+                    event = json.loads(line)
+                    if event.get("type") == "final":
+                        result = event.get("result") or {}
+                        result["sources"] = _citation_details(list(result.get("citations") or []))
+                        result["interaction_id"] = (result.get("scratch") or {}).get(
+                            "interaction_id"
+                        )
+                        event["result"] = result
+                    yield json.dumps(event, ensure_ascii=True) + "\n"
+                    if event.get("type") == "final":
+                        renamed = generate_conversation_title(conversation_id, question)
+                        if renamed is not None:
+                            yield json.dumps({"type": "conversation", "conversation": renamed}) + "\n"
 
         return StreamingResponse(output(), media_type="application/x-ndjson")
 

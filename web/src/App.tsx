@@ -38,6 +38,7 @@ import {
   api,
   type Decision,
   type Conversation,
+  type MetadataFilters,
   type Paper,
   type Source,
   type Status,
@@ -47,6 +48,7 @@ import {
   uploadPdf,
   write,
 } from "./api";
+import "./chat-filters.css";
 
 const progressLabels: Record<string, string> = {
   retrieving: "Searching the library",
@@ -101,7 +103,10 @@ function SourceDrawer({
           <X />
         </button>
       </header>
-      <p className="section-label">{source.section}</p>
+      <p className="section-label">
+        {source.section}
+        {source.page_number ? ` · Page ${source.page_number}` : ""}
+      </p>
       <blockquote>{source.text}</blockquote>
       <div className="drawer-actions">
         {source.arxiv_url && (
@@ -259,6 +264,7 @@ function ChatPage({
   const [source, setSource] = useState<Source>();
   const [scope, setScope] = useState<"library" | "topic" | "paper">("library");
   const [target, setTarget] = useState("");
+  const [filters, setFilters] = useState<MetadataFilters>({});
   const selectedScope = active?.scope_type ?? scope;
   const selectedTarget = active?.scope_target ?? target;
   const [searchParams] = useSearchParams();
@@ -396,62 +402,67 @@ function ChatPage({
       ],
     }));
     try {
-      await streamMessage(conversationId, question, (event) => {
-        if (event.type === "conversation") {
-          const updated = event.conversation as Conversation;
-          if (updated.title !== "New conversation") {
-            setConversations((current) =>
-              current.map((item) =>
-                item.id === updated.id
-                  ? { ...item, title: updated.title }
-                  : item,
-              ),
-            );
-            setActive((current) =>
-              current?.id === updated.id
-                ? { ...current, title: updated.title }
-                : current,
-            );
+      await streamMessage(
+        conversationId,
+        question,
+        (event) => {
+          if (event.type === "conversation") {
+            const updated = event.conversation as Conversation;
+            if (updated.title !== "New conversation") {
+              setConversations((current) =>
+                current.map((item) =>
+                  item.id === updated.id
+                    ? { ...item, title: updated.title }
+                    : item,
+                ),
+              );
+              setActive((current) =>
+                current?.id === updated.id
+                  ? { ...current, title: updated.title }
+                  : current,
+              );
+            }
           }
-        }
-        if (event.type === "progress") {
-          updateSession(conversationId, (current) => ({
-            ...current,
-            stage: String(event.stage),
-          }));
-        }
-        if (event.type === "final") {
-          const result = event.result as Record<string, unknown>;
-          const turn: Turn = {
-            id: result.interaction_id as number | undefined,
-            question,
-            answer: String(result.answer ?? ""),
-            citations: (result.citations as string[]) ?? [],
-            sources: (result.sources as Source[]) ?? [],
-            confidence: Number(result.confidence ?? 0),
-          };
-          updateSession(conversationId, (current) => ({
-            ...current,
-            turns: [...current.turns.slice(0, -1), turn],
-            stage: "",
-          }));
-        }
-        if (event.type === "error") {
-          updateSession(conversationId, (current) => ({
-            ...current,
-            turns: [
-              ...current.turns.slice(0, -1),
-              {
-                question,
-                answer: String(event.message),
-                citations: [],
-                sources: [],
-              },
-            ],
-            stage: "",
-          }));
-        }
-      });
+          if (event.type === "progress") {
+            updateSession(conversationId, (current) => ({
+              ...current,
+              stage: String(event.stage),
+            }));
+          }
+          if (event.type === "final") {
+            const result = event.result as Record<string, unknown>;
+            const turn: Turn = {
+              id: result.interaction_id as number | undefined,
+              question,
+              answer: String(result.answer ?? ""),
+              citations: (result.citations as string[]) ?? [],
+              sources: (result.sources as Source[]) ?? [],
+              confidence: Number(result.confidence ?? 0),
+            };
+            updateSession(conversationId, (current) => ({
+              ...current,
+              turns: [...current.turns.slice(0, -1), turn],
+              stage: "",
+            }));
+          }
+          if (event.type === "error") {
+            updateSession(conversationId, (current) => ({
+              ...current,
+              turns: [
+                ...current.turns.slice(0, -1),
+                {
+                  question,
+                  answer: String(event.message),
+                  citations: [],
+                  sources: [],
+                },
+              ],
+              stage: "",
+            }));
+          }
+        },
+        filters,
+      );
     } catch (err) {
       updateSession(conversationId, (current) => ({
         ...current,
@@ -606,6 +617,95 @@ function ChatPage({
               </select>
             )}
           </div>
+          <details className="composer-filters">
+            <summary>Search filters</summary>
+            <div className="composer-filter-fields">
+              <label>
+                From year
+                <input
+                  type="number"
+                  min="1800"
+                  max="2100"
+                  value={filters.min_year ?? ""}
+                  onChange={(event) =>
+                    setFilters((current) => ({
+                      ...current,
+                      min_year: event.target.value
+                        ? Number(event.target.value)
+                        : undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                To year
+                <input
+                  type="number"
+                  min="1800"
+                  max="2100"
+                  value={filters.max_year ?? ""}
+                  onChange={(event) =>
+                    setFilters((current) => ({
+                      ...current,
+                      max_year: event.target.value
+                        ? Number(event.target.value)
+                        : undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Venue
+                <input
+                  type="text"
+                  maxLength={128}
+                  placeholder="e.g. NeurIPS"
+                  value={filters.venue ?? ""}
+                  onChange={(event) =>
+                    setFilters((current) => ({
+                      ...current,
+                      venue: event.target.value || undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Section
+                <select
+                  value={filters.section_types?.[0] ?? ""}
+                  onChange={(event) =>
+                    setFilters((current) => ({
+                      ...current,
+                      section_types: event.target.value
+                        ? [event.target.value]
+                        : [],
+                    }))
+                  }
+                >
+                  <option value="">Any section</option>
+                  {[
+                    "abstract",
+                    "intro",
+                    "background",
+                    "related",
+                    "method",
+                    "experiments",
+                    "results",
+                    "discussion",
+                    "analysis",
+                    "conclusion",
+                    "limitations",
+                    "appendix",
+                    "body",
+                  ].map((section) => (
+                    <option key={section} value={section}>
+                      {section}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </details>
           <textarea
             value={message}
             disabled={creating}

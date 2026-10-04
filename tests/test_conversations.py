@@ -1,7 +1,9 @@
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -166,6 +168,73 @@ class ConversationTitleTests(unittest.TestCase):
         self.assertEqual([event["type"] for event in events], ["conversation", "error"])
         self.assertEqual(self.stream_message([], question="  ").status_code, 400)
         self.model.invoke.assert_not_called()
+
+    def test_message_metadata_filters_are_validated_and_forwarded(self):
+        config = SimpleNamespace(rag=SimpleNamespace(history_turns=4))
+        lines = [json.dumps({"type": "final", "result": {"answer": "Answer", "citations": []}}) + "\n"]
+        with TestClient(create_app()) as client, patch("assistant.web.app.get_config", return_value=config), patch(
+            "assistant.web.app.stream_graph", return_value=iter(lines),
+        ) as run:
+            url = f"/api/conversations/{self.conversation_id}/messages"
+            headers = {"X-Requested-With": "assistant-ui"}
+            response = client.post(url, json={"message": "Methods?", "filters": {
+                "min_year": 2020, "section_types": ["method"],
+            }}, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(run.call_args.args[0]["scratch"]["metadata_filters"], {
+                "min_year": 2020, "section_types": ["method"],
+            })
+            invalid = client.post(url, json={"message": "Methods?", "filters": {
+                "min_year": 2025, "max_year": 2020,
+            }}, headers=headers)
+            self.assertEqual(invalid.status_code, 422)
+            run.assert_called_once()
+
+    def test_same_conversation_turns_wait_and_reload_history(self):
+        first_started = threading.Event()
+        finish_first = threading.Event()
+        first_saved = threading.Event()
+        second_started = threading.Event()
+        histories = {}
+
+        def stream(state):
+            question = state["question"]
+            histories[question] = state["scratch"]["history"]
+            if question == "first":
+                first_started.set()
+                self.assertTrue(finish_first.wait(timeout=10))
+                first_saved.set()
+            else:
+                second_started.set()
+            yield json.dumps({"type": "final", "result": {"answer": question, "citations": []}}) + "\n"
+
+        def history(*args):
+            return [{"question": "first", "answer": "first"}] if first_saved.is_set() else []
+
+        config = SimpleNamespace(rag=SimpleNamespace(history_turns=4))
+        with TestClient(create_app()) as client, patch(
+            "assistant.web.app.get_config", return_value=config
+        ), patch("assistant.web.app.stream_graph", side_effect=stream), patch(
+            "assistant.web.app.conversation_history", side_effect=history
+        ), patch("assistant.web.app.generate_conversation_title", return_value=None):
+            def send(message):
+                return client.post(
+                    f"/api/conversations/{self.conversation_id}/messages",
+                    json={"message": message}, headers={"X-Requested-With": "assistant-ui"},
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(send, "first")
+                self.assertTrue(first_started.wait(timeout=10))
+                second = executor.submit(send, "second")
+                try:
+                    self.assertFalse(second_started.wait(timeout=0.1))
+                finally:
+                    finish_first.set()
+                self.assertEqual(first.result(timeout=10).status_code, 200)
+                self.assertEqual(second.result(timeout=10).status_code, 200)
+        self.assertEqual(histories["first"], [])
+        self.assertEqual(histories["second"], [{"question": "first", "answer": "first"}])
 
 
 if __name__ == "__main__":

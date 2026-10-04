@@ -4,7 +4,7 @@ Guidance for Claude Code (and other AI coding agents) working in this repository
 
 ## TL;DR
 
-- Single-user, personal AI research assistant. Tracks research domains, curates papers from arxiv, answers questions with citations.
+- Research assistant tracking domains, curating arXiv papers, and answering with citations. The current localhost implementation is single-user; multi-user access is a requirement but needs authentication, authorization, and data isolation (see `PLANNER.md`). Do not equate concurrent requests with multi-user support.
 - **Config-driven** is the core principle: provider/model is chosen per-agent-role in `config.yaml`, RAG mode (vanilla/agentic) is a config toggle, MCP servers are added by YAML edit. Don't hard-code these.
 - **All nine agents are real LangGraph nodes** from day 1. Some are deeper than others. Do not delete or merge nodes — they're the public topology of the system.
 - The approved design and build order live at `~/.claude/plans/i-want-to-develop-enchanted-wozniak.md`. The narrative ("why this shape?") is there.
@@ -21,13 +21,15 @@ assistant/
 
   web/
     app.py           # localhost FastAPI routes + SPA serving
-    runner.py        # graph streaming + serialized in-memory jobs
+    runner.py        # graph streaming + bounded concurrent in-memory jobs
+    api_client.py    # loopback-only HTTP client for optional Streamlit UI
+  streamlit_app.py   # optional Streamlit frontend; uses FastAPI, not embedded stores
     static/          # generated Vite build; gitignored
 
   agents/            # One file per node — all are real, some stubs are intentional
     orchestrator.py  # intent dispatch
     qa.py            # claim generation + evidence verification; low-conf info_gatherer detour
-    retrieval.py     # vanilla vs agentic, paper/topic scope, follow-up rewrite
+    retrieval.py     # vanilla vs agentic, paper/topic/metadata scope, query rewrite
     curator.py       # per-topic LLM judge; preserves accepted and rejected results
     ingestion.py     # delegates to rag.ingest.ingest_source
     info_gatherer.py # binds MCP tools to the info_gatherer LLM
@@ -47,6 +49,8 @@ assistant/
     retriever.py     # hybrid dense+BM25 with RRF fusion; cache invalidated on ingest/removal
     reranker.py      # optional cross-encoder via sentence-transformers (lazy import)
     agentic.py       # decompose -> retrieve -> critique loop -> rerank
+    compress.py      # extractive answer-context windows; retains full evidence text
+    filters.py       # validated per-question publication/section filters
     ingest.py        # end-to-end: source -> chunks -> embeddings -> stores
 
   storage/
@@ -87,6 +91,7 @@ assistant/
 
 - QA generates validated, single-line claim blocks with per-claim source numbers and exact supporting quotes. General knowledge is allowed; do not force every claim to cite a paper.
 - A paper citation requires both quote occurrence in the retrieved chunk (whitespace-normalized) and a positive whole-claim verdict from a separate verifier call. The verifier uses `citation_verifier`, falling back to `qa` for older configs. It is a service call inside the existing QA node, not a new graph node.
+- When prompt compression is enabled, the quote must also occur in the exact excerpt the generator saw. Keep the full chunk in state and verifier context; never verify a model-generated summary as paper evidence.
 - The application renders citation markers only from verified evidence. Do not reintroduce raw model-supplied markers or trust a standalone citations list. Missing/invalid evidence and verifier failures must withhold citations.
 - Claims without accepted citations receive the `LLM knowledge` label. This means unverified against paper sources, not proven correct. External tool context and prior-turn citations are not evidence for current paper citations.
 - Keep the public `answer`, `citations` (chunk IDs), `confidence`, and `retrieved_chunks` contract unchanged. Run `python -m unittest discover -s tests -p test_qa.py -v` after citation-policy changes; the tests mock models and do not establish real-model citation accuracy.
@@ -119,12 +124,13 @@ assistant/
 - Auto-name only chats still titled `New conversation`. `generate_conversation_title()` uses the first saved question and `conversation_title` (fallback `qa`), calls the model outside the database transaction, and conditionally updates the placeholder. Preserve descriptive titles and deleted chats. Emit the title as a `conversation` event after the final answer; failures must not discard the answer. Run `python -m unittest discover -s tests -p test_conversations.py -v` after naming changes.
 - Paper PATCH requests update only explicitly supplied fields (`model_fields_set`); changing a star or reading status must not clear the topic or reset other preferences.
 - Frontend source lives in `web/`; `npm run build` writes generated assets to `assistant/web/static/`.
+- The optional Streamlit UI in `assistant/streamlit_app.py` talks only to local FastAPI through `assistant/web/api_client.py`. Never open a second embedded Qdrant client or use graph/storage directly from Streamlit; install via `pip install -e '.[streamlit]'`.
 - The API streams chat events as NDJSON. Keep event shapes compatible with `web/src/api.ts`.
 - The UI must keep reading after `final` for the optional title update, update the matching sidebar item, and change the active header only if that same conversation is still selected.
 - Keep `ChatPage` mounted and visible in `Shell` beside the active Library, Topics, or Inbox workspace. Workspace changes refresh chat lists and scope pickers, not the pending transcript. Drafts, turns, and progress are keyed by conversation ID; stream callbacks must update their originating session and ignore deleted sessions. Do not overwrite cached turns with incomplete saved history or treat workspace navigation as a full page reload.
 - New chat, history selection, and paper/topic chat actions must preserve the open workspace. Only the workspace close button or Chat navigation returns to chat-only mode. Keep workspace drawers/dialogs inside their pane; use the stacked responsive layout on narrow screens rather than hiding chat.
 - `ChatPage` renders New chat and history into `Shell`'s persistent sidebar slot through a portal. Keep those controls available from other tabs, below the page navigation separator; do not restore a second conversation rail. Scope controls belong inside the composer, including before any conversation exists.
-- Background ingest and monitor jobs are intentionally serialized and in memory.
+- Background ingest and monitor jobs use a configurable, bounded thread pool (two workers by default). Index writes and same-paper operations are coordinated in process; jobs remain in memory.
 
 ### Frontend
 
@@ -203,7 +209,7 @@ The tests use temporary SQLite databases and in-memory Qdrant. They cover prefer
 - **`sentence-transformers` is intentionally not in `pyproject.toml`.** Reranking degrades gracefully without it. Add it (`pip install sentence-transformers`) when you want better top-k quality.
 - **Marker, the recommended better parser, is also not in deps** — it's heavy. PyMuPDF gets us to working end-to-end; swap when needed (see "Replace the PDF parser").
 - **Manual CLI ingest has no topic option.** The shared ingest function and web UI support topic attribution; a future CLI `--domain` flag can thread it through `scratch`.
-- **Web background jobs are in memory.** They are serialized but disappear on server restart.
+- **Web background jobs are in memory.** They run on a bounded worker pool but disappear on server restart; keep one server process for embedded Qdrant and in-process locks.
 - **There is no general migration framework yet.** `get_engine()` lazily calls `create_all`, then adds missing `reading_status` and `is_favorite` columns with idempotent SQLite ALTER statements. Existing papers default to New and unstarred. Restart the API after upgrading; other changes to existing tables still need an explicit migration strategy.
 - **The BM25 index doesn't persist** — it's rebuilt per process from the SQLite chunks table. For very large libraries this becomes slow; the planned upgrade is Qdrant's native sparse vectors.
 - **`config.yaml` keys with no default in `AppConfig` will error on startup.** If you add an optional field, give it a `Field(default_factory=...)`.

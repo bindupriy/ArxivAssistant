@@ -18,6 +18,7 @@ from assistant.config import get_config
 from assistant.rag.embedder import Embedder
 from assistant.storage import CHUNKS_COLLECTION, Chunk as ChunkRow, search as qdrant_search
 from assistant.storage import session_scope
+from assistant.storage.index_lock import index_lock
 
 _TOKEN_RE = re.compile(r"\w+")
 
@@ -35,6 +36,7 @@ class RetrievedChunk:
     section_title: str
     score: float
     source: str  # "dense" | "sparse" | "fused"
+    page_number: int | None = None
 
 
 @dataclass
@@ -61,6 +63,7 @@ def _bm25() -> _BM25Index | None:
                 "text": r.text,
                 "section_type": r.section_type,
                 "section_title": r.section_title or "",
+                "page_number": r.page_number,
             }
     if not corpus:
         return None
@@ -69,7 +72,8 @@ def _bm25() -> _BM25Index | None:
 
 def invalidate_bm25_cache() -> None:
     """Call after ingestion so the BM25 index is rebuilt on next retrieval."""
-    _bm25.cache_clear()
+    with index_lock.write():
+        _bm25.cache_clear()
 
 
 def _dense(query: str, top_k: int, filt: dict[str, Any] | None) -> list[RetrievedChunk]:
@@ -87,6 +91,7 @@ def _dense(query: str, top_k: int, filt: dict[str, Any] | None) -> list[Retrieve
                 section_title=str(p.get("section_title", "")),
                 score=float(r["score"]),
                 source="dense",
+                page_number=p.get("page_number"),
             )
         )
     return out
@@ -96,17 +101,24 @@ def _sparse(
     query: str,
     top_k: int,
     paper_ids: list[str] | None = None,
+    metadata_filter: dict[str, Any] | None = None,
 ) -> list[RetrievedChunk]:
     idx = _bm25()
     if idx is None:
         return []
     scores = idx.bm25.get_scores(_tokenize(query))
     allowed = set(paper_ids) if paper_ids is not None else None
+    filters = metadata_filter or {}
     ranked = sorted(
         (
             (chunk_id, score)
             for chunk_id, score in zip(idx.chunk_ids, scores)
-            if allowed is None or idx.chunk_meta[chunk_id]["paper_id"] in allowed
+            if (allowed is None or idx.chunk_meta[chunk_id]["paper_id"] in allowed)
+            and all(
+                idx.chunk_meta[chunk_id].get(key) in values
+                if isinstance(values, list) else idx.chunk_meta[chunk_id].get(key) == values
+                for key, values in filters.items()
+            )
         ),
         key=lambda item: item[1],
         reverse=True,
@@ -123,6 +135,7 @@ def _sparse(
                 section_title=m["section_title"],
                 score=float(sc),
                 source="sparse",
+                page_number=m["page_number"],
             )
         )
     return out
@@ -133,15 +146,17 @@ def _rrf_fuse(
     sparse: list[RetrievedChunk],
     *,
     k: int = 60,
+    dense_weight: float = 1.0,
+    sparse_weight: float = 1.0,
 ) -> list[RetrievedChunk]:
-    """Reciprocal rank fusion. k=60 is the standard."""
+    """Weighted reciprocal rank fusion; scores need not be comparable across indexes."""
     by_id: dict[str, RetrievedChunk] = {}
     rrf_score: dict[str, float] = {}
     for rank, c in enumerate(dense):
-        rrf_score[c.id] = rrf_score.get(c.id, 0.0) + 1.0 / (k + rank + 1)
+        rrf_score[c.id] = rrf_score.get(c.id, 0.0) + dense_weight / (k + rank + 1)
         by_id.setdefault(c.id, c)
     for rank, c in enumerate(sparse):
-        rrf_score[c.id] = rrf_score.get(c.id, 0.0) + 1.0 / (k + rank + 1)
+        rrf_score[c.id] = rrf_score.get(c.id, 0.0) + sparse_weight / (k + rank + 1)
         by_id.setdefault(c.id, c)
     fused = sorted(by_id.values(), key=lambda c: rrf_score[c.id], reverse=True)
     for c in fused:
@@ -161,12 +176,21 @@ def hybrid_retrieve(
     """Return top_k chunks fused from dense + sparse retrieval."""
     cfg = get_config()
     top_k = top_k or cfg.rag.top_k
+    if metadata_filter and set(metadata_filter) - {"section_type", "page_number"}:
+        raise ValueError("Only section_type and page_number are supported as chunk filters")
+    if paper_ids == []:
+        return []
     dense_filter = dict(metadata_filter or {})
     if paper_ids is not None:
         dense_filter["paper_id"] = paper_ids
-    sparse = _sparse(query, candidate_k, paper_ids)
-    if not sparse:
-        return []
-    dense = _dense(query, candidate_k, dense_filter or None)
-    fused = _rrf_fuse(dense, sparse)
-    return fused[:top_k]
+    with index_lock.read():
+        sparse = _sparse(query, candidate_k, paper_ids, metadata_filter)
+        if not sparse:
+            return []
+        dense = _dense(query, candidate_k, dense_filter or None)
+        fused = _rrf_fuse(
+            dense, sparse,
+            dense_weight=cfg.rag.hybrid.dense_weight,
+            sparse_weight=cfg.rag.hybrid.sparse_weight,
+        )
+        return fused[:top_k]

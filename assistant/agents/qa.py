@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from assistant.agents.retrieval import retrieval_node
 from assistant.config import get_config
 from assistant.llm import get_router
+from assistant.rag.compress import compress_context
 from assistant.state import GraphState
 
 log = logging.getLogger(__name__)
@@ -83,8 +84,10 @@ def _verified_evidence(claims: list[_Claim], chunks: list[dict]) -> dict[int, li
             if evidence.source > len(chunks):
                 continue
             passage = str(chunks[evidence.source - 1].get("text", ""))
+            displayed = str(chunks[evidence.source - 1].get("context", passage))
             quote = " ".join(evidence.quote.split())
-            if not quote or quote not in " ".join(passage.split()):
+            if (not quote or quote not in " ".join(displayed.split())
+                    or quote not in " ".join(passage.split())):
                 continue
             candidate_id = len(candidates) + 1
             locations[candidate_id] = (claim_index, evidence.source)
@@ -173,7 +176,8 @@ def _format_context(chunks: list[dict]) -> str:
     parts = []
     for index, c in enumerate(chunks, start=1):
         title = c.get("section_title") or c.get("section_type", "body")
-        parts.append(f"[{index}] (paper={c['paper_id']}, section={title})\n{c['text']}")
+        page = f", page={c['page_number']}" if c.get("page_number") else ""
+        parts.append(f"[{index}] (paper={c['paper_id']}, section={title}{page})\n{c.get('context', c['text'])}")
     return "\n\n".join(parts) if parts else "(no chunks retrieved)"
 
 
@@ -229,6 +233,13 @@ def qa_node(state: GraphState) -> GraphState:
     chunks = state.get("retrieved_chunks") or []
     if not chunks:
         chunks = retrieval_node(state).get("retrieved_chunks", []) or []
+    compression = getattr(get_config().rag, "compression", None)
+    if compression is not None and compression.enabled and chunks:
+        chunks = compress_context(
+            chunks, question,
+            max_chars_per_chunk=compression.max_chars_per_chunk,
+            max_total_chars=compression.max_total_chars,
+        )
 
     _send_progress("answering")
     llm = get_router().chat("qa")
@@ -240,16 +251,21 @@ def qa_node(state: GraphState) -> GraphState:
         user_content = f"Conversation so far:\n{history_block}\n\n{user_content}"
     if mcp_block:
         user_content += f"\n\nAdditional context from external tools:\n{mcp_block}"
-    msg = llm.invoke([SystemMessage(content=_SYSTEM), HumanMessage(content=user_content)])
+    messages = [SystemMessage(content=_SYSTEM), HumanMessage(content=user_content)]
+    msg = llm.invoke(messages)
     try:
         draft = _Draft.model_validate(_parse(str(msg.content)))
     except ValidationError:
-        return {
-            "answer": "I couldn't reliably separate this answer's claims and evidence. Please try again.",
-            "citations": [],
-            "confidence": 0.0,
-            "retrieved_chunks": chunks,
-        }
+        try:
+            # Smaller local models sometimes add extra fields; retry with schema-constrained output.
+            draft = _Draft.model_validate(llm.with_structured_output(_Draft).invoke(messages))
+        except Exception:
+            return {
+                "answer": "I couldn't reliably separate this answer's claims and evidence. Please try again.",
+                "citations": [],
+                "confidence": 0.0,
+                "retrieved_chunks": chunks,
+            }
     accepted = _verified_evidence(draft.claims, chunks)
     answer, citations = _render_claims(draft.claims, chunks, accepted)
     confidence = draft.confidence

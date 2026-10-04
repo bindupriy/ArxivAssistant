@@ -10,8 +10,15 @@ export type Source = {
   arxiv_id?: string;
   section: string;
   text: string;
+  page_number?: number | null;
   arxiv_url?: string;
   pdf_url?: string;
+};
+export type MetadataFilters = {
+  min_year?: number;
+  max_year?: number;
+  venue?: string;
+  section_types?: string[];
 };
 export type Turn = {
   id?: number;
@@ -107,13 +114,14 @@ export async function streamMessage(
   conversationId: string,
   message: string,
   onEvent: (event: Record<string, unknown>) => void,
+  filters?: MetadataFilters,
 ): Promise<void> {
   const response = await fetch(
     `/api/conversations/${conversationId}/messages`,
     {
       method: "POST",
       headers: writeHeaders,
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, filters: filters ?? {} }),
     },
   );
   if (!response.ok || !response.body) throw new Error(await response.text());

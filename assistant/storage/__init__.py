@@ -19,6 +19,7 @@ from assistant.storage.schema import (
     Domain,
     Interaction,
     Paper,
+    PaperCitation,
     ProfileFact,
 )
 from assistant.storage.sqlite_store import get_engine, session_scope
@@ -32,6 +33,7 @@ __all__ = [
     "Domain",
     "Interaction",
     "Paper",
+    "PaperCitation",
     "ProfileFact",
     "VectorRecord",
     "CHUNKS_COLLECTION",

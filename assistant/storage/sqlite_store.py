@@ -21,7 +21,10 @@ def get_engine() -> Engine:
     cfg = get_config()
     cfg.storage.ensure_dirs()
     url = f"sqlite:///{cfg.storage.sqlite_path.as_posix()}"
-    engine = create_engine(url, future=True)
+    engine = create_engine(url, future=True, connect_args={"timeout": 30})
+    # Multiple chat readers can run while a background ingest commits.
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         columns = {column["name"] for column in inspect(connection).get_columns("papers")}
@@ -33,6 +36,9 @@ def get_engine() -> Engine:
             connection.exec_driver_sql(
                 "ALTER TABLE papers ADD COLUMN is_favorite BOOLEAN NOT NULL DEFAULT 0"
             )
+        chunk_columns = {column["name"] for column in inspect(connection).get_columns("chunks")}
+        if "page_number" not in chunk_columns:
+            connection.exec_driver_sql("ALTER TABLE chunks ADD COLUMN page_number INTEGER")
     return engine
 
 

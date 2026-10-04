@@ -13,17 +13,18 @@ llm:
   #   conversation_title: { provider: openrouter, model: anthropic/claude-haiku-4.5 }
   #   embedder: { provider: openrouter, model: openai/text-embedding-3-small }
   roles:
-    orchestrator:  { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    qa:            { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    citation_verifier: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    conversation_title: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    retrieval:     { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    curator_judge: { provider: openrouter, model: google/gemma-4-31b:free }
-    summarizer:    { provider: openrouter, model: qwen/qwen3.8-27b:free }
-    criteria:      { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    info_gatherer: { provider: openrouter, model: nvidia/nemotron-3-ultra-550b-a55b:free }
-    embedder:      { provider: openrouter, model: liquid/lfm-2.5-embedding-350m:free }
-    reranker:      { provider: openrouter, model: nvidia/llama-nemotron-rerank-vl-1b-v2:free }
+    orchestrator:  { provider: ollama, model: qwen2.5:3b }
+    qa:            { provider: ollama, model: qwen2.5:3b }
+    citation_verifier: { provider: ollama, model: qwen2.5:3b }
+    conversation_title: { provider: ollama, model: qwen2.5:3b }
+    retrieval:     { provider: ollama, model: qwen2.5:3b }
+    curator_judge: { provider: ollama, model: qwen2.5:3b }
+    summarizer:    { provider: ollama, model: qwen2.5:3b }
+    criteria:      { provider: ollama, model: qwen2.5:3b }
+    info_gatherer: { provider: ollama, model: qwen2.5:3b }
+    embedder:      { provider: ollama, model: nomic-embed-text }
+    # Reranking does not support Ollama; without sentence-transformers it falls back to hybrid order.
+    reranker:      { provider: local, model: cross-encoder/ms-marco-MiniLM-L6-v2 }
 
 rag:
   mode: vanilla          # vanilla | agentic
@@ -34,6 +35,18 @@ rag:
     sparse_weight: 0.3
   agentic:
     max_iters: 3
+  graph:
+    enabled: true         # expand hybrid results via explicit arXiv citation links
+    max_neighbors: 6
+    graph_slots: 2        # at most this many of the final top_k come from graph neighbors
+  query_rewrite:
+    enabled: true
+    first_turn: true     # extra model call to expand terse standalone questions
+    max_chars: 300
+  compression:
+    enabled: true
+    max_chars_per_chunk: 400
+    max_total_chars: 3200
 
 domains:
   # Example:
@@ -63,3 +76,6 @@ curation:
 monitor:
   enabled: false
   interval_minutes: 360
+
+concurrency:
+  background_workers: 2  # parallel ingest/monitor jobs; keep modest with local Ollama

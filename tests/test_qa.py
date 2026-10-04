@@ -5,7 +5,8 @@ from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
-from assistant.agents.qa import _Claim, _parse, _render_claims, _verified_evidence, qa_node
+from assistant.agents.qa import _Claim, _Draft, _parse, _render_claims, _verified_evidence, qa_node
+from assistant.rag.compress import compress_context
 
 
 class CitationTests(unittest.TestCase):
@@ -79,6 +80,45 @@ class CitationTests(unittest.TestCase):
         accepted, _, _ = self.verify([claim], [{"candidate": 1, "supported": True}])
         self.assertEqual(accepted, {0: [1]})
 
+    def test_compression_keeps_exact_prompt_excerpts_and_original_sources(self):
+        text = "Background unrelated. " * 25 + "Adaptive retrieval uses a sparse index." + " More material." * 20
+        original = [{"id": "one", "paper_id": "paper", "text": text, "section_type": "method"}]
+        compressed = compress_context(original, "adaptive retrieval", max_chars_per_chunk=110, max_total_chars=110)
+        self.assertIsNot(compressed[0], original[0])
+        self.assertEqual(compressed[0]["text"], text)
+        self.assertLessEqual(len(compressed[0]["context"]), 110)
+        self.assertIn("Adaptive retrieval uses a sparse index.", compressed[0]["context"])
+
+        generator = Mock()
+        generator.invoke.return_value = SimpleNamespace(content=json.dumps({
+            "claims": [{"text": "It uses a sparse index.",
+                        "evidence": [{"source": 1, "quote": "Adaptive retrieval uses a sparse index."}]}],
+            "confidence": 0.9,
+        }))
+        verifier = Mock()
+        verifier.invoke.return_value = SimpleNamespace(content='{"verdicts": [{"candidate": 1, "supported": true}]}')
+        router = Mock()
+        router.chat.side_effect = lambda role: verifier if role == "citation_verifier" else generator
+        config = SimpleNamespace(llm=SimpleNamespace(roles={"citation_verifier": object()}), rag=SimpleNamespace(
+            history_turns=4, compression=SimpleNamespace(enabled=True, max_chars_per_chunk=110, max_total_chars=110),
+        ))
+        with patch("assistant.agents.qa.get_router", return_value=router), patch("assistant.agents.qa.get_config", return_value=config):
+            result = qa_node({"question": "adaptive retrieval", "retrieved_chunks": original})
+        self.assertEqual(result["citations"], ["one"])
+        self.assertEqual(result["retrieved_chunks"][0]["text"], text)
+        self.assertNotIn("Background unrelated. " * 25, generator.invoke.call_args.args[0][1].content)
+        payload = json.loads(verifier.invoke.call_args.args[0][1].content)
+        self.assertEqual(payload["candidates"][0]["passage"], text)
+
+    def test_quote_outside_displayed_excerpt_cannot_be_cited(self):
+        chunks = [{"id": "one", "paper_id": "paper", "text": "Hidden quote. Visible passage.",
+                   "context": "Visible passage."}]
+        claim = self.claim(text="Hidden claim.", quote="Hidden quote.")
+        with patch("assistant.agents.qa.get_router") as router:
+            self.assertEqual(_verified_evidence([claim], chunks), {})
+            router.assert_not_called()
+        self.assertIn("LLM knowledge", _render_claims([claim], chunks, {})[0])
+
     def test_verifier_role_falls_back_for_existing_configs(self):
         config = SimpleNamespace(llm=SimpleNamespace(roles={"qa": object()}))
         router = Mock()
@@ -132,6 +172,22 @@ class CitationTests(unittest.TestCase):
                 self.assertEqual(result["citations"], [])
                 self.assertEqual(result["confidence"], 0.0)
                 verifier.invoke.assert_not_called()
+
+    def test_invalid_draft_can_retry_with_structured_output(self):
+        generator = Mock()
+        generator.invoke.return_value = SimpleNamespace(content='{"claims": [], "confidence": 1}')
+        generator.with_structured_output.return_value.invoke.return_value = _Draft.model_validate({
+            "claims": [{"text": "I cannot identify a paper without evidence.", "evidence": []}],
+            "confidence": 0.3,
+        })
+        config = SimpleNamespace(rag=SimpleNamespace(history_turns=4))
+        with patch("assistant.agents.qa.get_router") as router, patch("assistant.agents.qa.get_config", return_value=config), patch("assistant.agents.qa.retrieval_node", return_value={"retrieved_chunks": []}):
+            router.return_value.chat.return_value = generator
+            result = qa_node({"question": "Explain the paper", "retrieved_chunks": []})
+        generator.with_structured_output.assert_called_once_with(_Draft)
+        self.assertEqual(result["answer"], "I cannot identify a paper without evidence. *(LLM knowledge)*")
+        self.assertEqual(result["citations"], [])
+        self.assertEqual(result["confidence"], 0.3)
 
     def test_parse_accepts_fenced_json_but_not_non_object_json(self):
         self.assertEqual(_parse('```json\n{"claims": []}\n```'), {"claims": []})

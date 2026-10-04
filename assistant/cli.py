@@ -15,11 +15,13 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from pydantic import ValidationError
 
 from sqlalchemy import func, select
 
 from assistant.config import get_config
 from assistant.graph import get_graph
+from assistant.rag.filters import MetadataFilters
 from assistant.storage.domains import sync_domains_from_config
 from assistant.storage import (
     Chunk,
@@ -60,9 +62,30 @@ def _invoke(state: dict) -> dict:
 
 
 @app.command()
-def ask(question: str = typer.Argument(..., help="Your question.")) -> None:
+def ask(
+    question: str = typer.Argument(..., help="Your question."),
+    min_year: int | None = typer.Option(None, help="Earliest publication year."),
+    max_year: int | None = typer.Option(None, help="Latest publication year."),
+    venue: str | None = typer.Option(None, help="Exact publication venue (case-insensitive)."),
+    section: list[str] | None = typer.Option(None, help="Section type; repeat to include several."),
+    domain: str | None = typer.Option(None, help="Limit retrieval to a topic."),
+    paper: str | None = typer.Option(None, help="Limit retrieval to a paper ID."),
+) -> None:
     """Ask the assistant a question over the curated knowledge base."""
-    result = _invoke({"intent": "ask", "question": question})
+    if domain and paper:
+        raise typer.BadParameter("Choose either --domain or --paper, not both")
+    try:
+        filters = MetadataFilters(min_year=min_year, max_year=max_year, venue=venue, section_types=section or [])
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    state: dict = {"intent": "ask", "question": question}
+    if domain:
+        state["domain"] = domain
+    if paper:
+        state["paper_ids"] = [paper]
+    if filters.model_dump(exclude_defaults=True):
+        state["scratch"] = {"metadata_filters": filters.model_dump(exclude_defaults=True)}
+    result = _invoke(state)
     console.print(result.get("answer", "[no answer]"))
     citations = result.get("citations") or []
     if citations:

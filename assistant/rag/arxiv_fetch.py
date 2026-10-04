@@ -31,6 +31,47 @@ def is_arxiv_id(s: str) -> bool:
     return bool(ARXIV_ID_RE.match(s.strip()))
 
 
+def search_papers(query: str, limit: int = 8) -> list[dict]:
+    """Preview matching arXiv papers without downloading their PDFs."""
+    import arxiv
+
+    query = query.strip()
+    if is_arxiv_id(query):
+        search = arxiv.Search(id_list=[query])
+    else:
+        tokens = list(dict.fromkeys(re.findall(r"[a-zA-Z0-9-]{2,}", query)))[:8]
+        if not tokens:
+            return []
+        search = arxiv.Search(
+            query=" OR ".join(f"all:{term}" for term in tokens),
+            max_results=30,
+            sort_by=arxiv.SortCriterion.Relevance,
+        )
+    matches = []
+    for result in arxiv.Client(page_size=30, num_retries=2).results(search):
+        matches.append({
+            "arxiv_id": result.get_short_id(),
+            "title": result.title.strip(),
+            "authors": [author.name for author in result.authors],
+            "abstract": result.summary.strip(),
+            "year": result.published.year if result.published else None,
+        })
+    if not is_arxiv_id(query):
+        terms = {
+            token.lower()[:-1] if len(token) > 4 and token.lower().endswith("s")
+            and not token.lower().endswith("is") else token.lower()
+            for token in tokens
+        }
+        matches.sort(
+            key=lambda paper: (
+                -sum(term in paper["title"].lower() for term in terms) * 2
+                - sum(term in paper["abstract"].lower() for term in terms),
+                paper["arxiv_id"],
+            )
+        )
+    return matches[:limit]
+
+
 def _download_pdf(url: str, target: Path) -> None:
     import httpx
 

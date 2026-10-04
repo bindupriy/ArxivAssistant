@@ -21,7 +21,7 @@ from assistant.storage.qdrant_store import (
     upsert,
 )
 from assistant.storage.sqlite_store import _session_factory, get_engine
-from assistant.web.app import create_app
+from assistant.web.app import _citation_details, create_app
 
 
 class LibraryTests(unittest.TestCase):
@@ -103,6 +103,28 @@ class LibraryTests(unittest.TestCase):
         self.update(is_favorite=False)
         self.assertEqual(self.client.get("/api/papers?is_favorite=true").json(), [])
 
+    def test_citation_source_points_to_physical_pdf_page(self):
+        with session_scope() as session:
+            session.get(Chunk, "chunk-first").page_number = 3
+            session.get(Paper, "first").pdf_path = str(self.directory / "original.pdf")
+        source = _citation_details(["chunk-first"])[0]
+        self.assertEqual(source["page_number"], 3)
+        self.assertEqual(source["pdf_url"], "/api/papers/first/pdf#page=3")
+
+    def test_search_arxiv_previews_and_marks_indexed_papers(self):
+        with session_scope() as session:
+            session.add(Paper(id="2104.09864v5", title="RoFormer", arxiv_id="2104.09864v5"))
+        preview = [{"arxiv_id": "2104.09864v5", "title": "RoFormer", "abstract": "RoPE",
+                    "authors": ["Researcher"], "year": 2021}]
+        with patch("assistant.web.app.search_arxiv_papers", return_value=preview) as search:
+            response = self.client.get("/api/arxiv/search", params={"q": "RoPE"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()[0]["paper_id"], "2104.09864v5")
+            search.assert_called_once_with("RoPE")
+            self.assertEqual(self.client.get("/api/arxiv/search", params={"q": "x"}).status_code, 422)
+        with patch("assistant.web.app.search_arxiv_papers", side_effect=RuntimeError("upstream")):
+            self.assertEqual(self.client.get("/api/arxiv/search", params={"q": "RoPE"}).status_code, 502)
+
     def test_validation_and_write_protection(self):
         self.assertEqual(self.update(reading_status="invalid").status_code, 422)
         self.assertEqual(self.update(reading_status=None).status_code, 422)
@@ -178,6 +200,8 @@ class MigrationTests(unittest.TestCase):
             with engine.begin() as connection:
                 connection.exec_driver_sql("CREATE TABLE papers (id VARCHAR(64) PRIMARY KEY, title TEXT NOT NULL)")
                 connection.exec_driver_sql("INSERT INTO papers (id, title) VALUES ('old', 'Existing paper')")
+                connection.exec_driver_sql("CREATE TABLE chunks (id VARCHAR(64) PRIMARY KEY, paper_id VARCHAR(64), text TEXT NOT NULL)")
+                connection.exec_driver_sql("INSERT INTO chunks (id, paper_id, text) VALUES ('old-chunk', 'old', 'Old text')")
             engine.dispose()
             storage = SimpleNamespace(sqlite_path=path, ensure_dirs=Mock())
             with patch("assistant.storage.sqlite_store.get_config", return_value=SimpleNamespace(storage=storage)):
@@ -188,6 +212,10 @@ class MigrationTests(unittest.TestCase):
                         self.assertEqual(
                             connection.execute(text("SELECT reading_status, is_favorite FROM papers")).one(),
                             ("new", 0),
+                        )
+                        self.assertEqual(
+                            connection.execute(text("SELECT id, page_number FROM chunks")).one(),
+                            ("old-chunk", None),
                         )
                     engine.dispose()
                 get_engine.cache_clear()

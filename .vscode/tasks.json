@@ -1,0 +1,43 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run FastAPI API",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"-m",
+				"uvicorn",
+				"assistant.web.app:create_app",
+				"--factory",
+				"--host",
+				"127.0.0.1",
+				"--port",
+				"8000"
+			],
+			"isBackground": true,
+			"group": "build"
+		},
+		{
+			"label": "Run Streamlit UI",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"-m",
+				"streamlit",
+				"run",
+				"assistant/streamlit_app.py",
+				"--server.address",
+				"127.0.0.1",
+				"--server.port",
+				"8501",
+				"--server.headless",
+				"true",
+				"--browser.gatherUsageStats",
+				"false"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}

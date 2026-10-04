@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from assistant.llm import get_router
 from assistant.memory.criteria_store import append_version, get_active
 from assistant.state import GraphState
+from assistant.storage.index_lock import resource_lock
 
 _SYSTEM = """You manage curation criteria for a single-user research paper assistant.
 You will be given (1) the currently active criteria for a domain and (2) a new
@@ -56,6 +57,12 @@ def criteria_node(state: GraphState) -> GraphState:
     comment = state.get("user_comment", "").strip()
     if not domain or not comment:
         return {"new_criteria_version": None}
+
+    with resource_lock(f"criteria:{domain}"):
+        return _update_criteria(domain, comment)
+
+
+def _update_criteria(domain: str, comment: str) -> GraphState:
 
     current = get_active(domain)
     current_blob = {

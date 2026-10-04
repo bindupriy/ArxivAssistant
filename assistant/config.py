@@ -29,12 +29,30 @@ class LLMConfig(BaseModel):
 
 
 class HybridConfig(BaseModel):
-    dense_weight: float = 0.7
-    sparse_weight: float = 0.3
+    dense_weight: float = Field(default=0.7, ge=0)
+    sparse_weight: float = Field(default=0.3, ge=0)
 
 
 class AgenticRAGConfig(BaseModel):
     max_iters: int = 3
+
+
+class GraphRAGConfig(BaseModel):
+    enabled: bool = False
+    max_neighbors: int = Field(default=6, ge=1, le=20)
+    graph_slots: int = Field(default=2, ge=0, le=8)
+
+
+class QueryRewriteConfig(BaseModel):
+    enabled: bool = True
+    first_turn: bool = False
+    max_chars: int = Field(default=300, ge=80, le=1000)
+
+
+class CompressionConfig(BaseModel):
+    enabled: bool = False
+    max_chars_per_chunk: int = Field(default=400, ge=100, le=5000)
+    max_total_chars: int = Field(default=3200, ge=200, le=20000)
 
 
 class RAGConfig(BaseModel):
@@ -44,6 +62,9 @@ class RAGConfig(BaseModel):
     low_confidence_threshold: float = 0.5  # below this, ask the Info Gatherer
     hybrid: HybridConfig = Field(default_factory=HybridConfig)
     agentic: AgenticRAGConfig = Field(default_factory=AgenticRAGConfig)
+    graph: GraphRAGConfig = Field(default_factory=GraphRAGConfig)
+    query_rewrite: QueryRewriteConfig = Field(default_factory=QueryRewriteConfig)
+    compression: CompressionConfig = Field(default_factory=CompressionConfig)
 
 
 class DomainConfig(BaseModel):
@@ -85,6 +106,10 @@ class MonitorConfig(BaseModel):
     interval_minutes: int = 360
 
 
+class ConcurrencyConfig(BaseModel):
+    background_workers: int = Field(default=2, ge=1, le=8)
+
+
 class AppConfig(BaseModel):
     """Structure of config.yaml."""
 
@@ -95,6 +120,7 @@ class AppConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     curation: CurationConfig = Field(default_factory=CurationConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
 
 
 class Settings(BaseSettings):

@@ -1,4 +1,4 @@
-"""Graph execution and serialized background jobs for the local web app."""
+"""Graph execution and bounded concurrent background jobs for the local web app."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Iterator
 
+from assistant.config import get_config
 from assistant.graph import get_graph
 
 
@@ -72,8 +73,9 @@ class Job:
 
 
 class JobManager:
-    def __init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="assistant-job")
+    def __init__(self, max_workers: int | None = None) -> None:
+        workers = max_workers if max_workers is not None else get_config().concurrency.background_workers
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="assistant-job")
         self._lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
 
@@ -103,6 +105,9 @@ class JobManager:
         with self._lock:
             jobs = sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
             return [asdict(job) for job in jobs]
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=True)
 
 
 jobs = JobManager()

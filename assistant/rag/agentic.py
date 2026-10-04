@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from assistant.config import get_config
 from assistant.llm import get_router
+from assistant.rag.graph_retriever import graph_retrieve
 from assistant.rag.reranker import rerank
 from assistant.rag.retriever import RetrievedChunk, hybrid_retrieve
 
@@ -70,6 +72,7 @@ def agentic_retrieve(
     *,
     top_k: int | None = None,
     paper_ids: list[str] | None = None,
+    metadata_filter: dict[str, Any] | None = None,
 ) -> list[RetrievedChunk]:
     cfg = get_config()
     top_k = top_k or cfg.rag.top_k
@@ -80,7 +83,8 @@ def agentic_retrieve(
     iteration = 0
     while iteration < max_iters:
         for sq in sub_queries:
-            for c in hybrid_retrieve(sq, top_k=max(top_k, 8), paper_ids=paper_ids):
+            retrieve = graph_retrieve if cfg.rag.graph.enabled else hybrid_retrieve
+            for c in retrieve(sq, top_k=max(top_k, 8), paper_ids=paper_ids, metadata_filter=metadata_filter):
                 seen.setdefault(c.id, c)
         gaps = _critique(question, list(seen.values()))
         if not gaps:

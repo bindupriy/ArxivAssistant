@@ -4,9 +4,15 @@ from sqlalchemy import select
 
 from assistant.config import get_config
 from assistant.storage import Domain, session_scope
+from assistant.storage.index_lock import resource_lock
 
 
 def sync_domains_from_config() -> tuple[int, int]:
+    with resource_lock("domains-sync"):
+        return _sync_domains()
+
+
+def _sync_domains() -> tuple[int, int]:
     added = 0
     updated = 0
     with session_scope() as session:

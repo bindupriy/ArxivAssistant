@@ -13,13 +13,16 @@ from assistant.rag.arxiv_fetch import ArxivPaper, fetch, is_arxiv_id
 from assistant.rag.chunker import Chunk as PaperChunk
 from assistant.rag.chunker import chunk_paper
 from assistant.rag.embedder import Embedder
+from assistant.rag.graph_retriever import extract_arxiv_references
 from assistant.rag.parser import parse_pdf
+from assistant.storage.index_lock import index_lock, paper_lock
 from assistant.storage import (
     CHUNKS_COLLECTION,
     PAPERS_COLLECTION,
     Chunk as ChunkRow,
     Domain,
     Paper as PaperRow,
+    PaperCitation,
     VectorRecord,
     delete_by_paper,
     session_scope,
@@ -34,6 +37,12 @@ def ingest_source(
     accepted_score: float | None = None,
 ) -> str:
     """source = arxiv ID or path to a PDF. Returns the paper id stored."""
+    key = source.strip() if is_arxiv_id(source) else Path(source).stem
+    with paper_lock(key):
+        return _ingest_source(source, domain=domain, accepted_score=accepted_score)
+
+
+def _ingest_source(source: str, *, domain: str | None, accepted_score: float | None) -> str:
     if is_arxiv_id(source):
         meta = fetch(source.strip(), get_config().storage.pdf_dir)
     else:
@@ -68,14 +77,34 @@ def ingest_source(
         domain=domain,
         accepted_score=accepted_score,
     )
-    # Invalidate the in-memory BM25 index so the new chunks are searchable
-    # without a process restart.
-    from assistant.rag.retriever import invalidate_bm25_cache
-    invalidate_bm25_cache()
     return paper_id
 
 
 def _persist(
+    meta: ArxivPaper,
+    parsed,
+    chunks: list[PaperChunk],
+    chunk_vectors: list[list[float]],
+    paper_vector: list[float],
+    abstract: str,
+    *,
+    domain: str | None,
+    accepted_score: float | None,
+) -> None:
+    with index_lock.write():
+        try:
+            _persist_unlocked(
+                meta, parsed, chunks, chunk_vectors, paper_vector, abstract,
+                domain=domain, accepted_score=accepted_score,
+            )
+        finally:
+            # SQLite may have committed before a Qdrant write fails.
+            from assistant.rag.retriever import invalidate_bm25_cache
+
+            invalidate_bm25_cache()
+
+
+def _persist_unlocked(
     meta: ArxivPaper,
     parsed,
     chunks: list[PaperChunk],
@@ -139,8 +168,15 @@ def _persist(
                     text=c.text,
                     char_start=c.char_start,
                     char_end=c.char_end,
+                    page_number=c.page_number,
                 )
             )
+
+        for old in list(s.query(PaperCitation).filter(PaperCitation.source_id == paper_id)):
+            s.delete(old)
+        s.flush()
+        for target in sorted(extract_arxiv_references(parsed.full_text, paper_id) if parsed else []):
+            s.add(PaperCitation(source_id=paper_id, target_arxiv_id=target))
 
     # Vectors: chunk-level and paper-level.
     delete_by_paper(paper_id)
@@ -157,6 +193,7 @@ def _persist(
                         "section_title": c.section_title,
                         "order": c.order,
                         "text": c.text,
+                        "page_number": c.page_number,
                     },
                 )
                 for c, v in zip(chunks, chunk_vectors)

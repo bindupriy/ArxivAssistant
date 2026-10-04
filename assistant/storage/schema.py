@@ -74,6 +74,9 @@ class Paper(Base):
     chunks: Mapped[list["Chunk"]] = relationship(
         back_populates="paper", cascade="all, delete-orphan"
     )
+    citations: Mapped[list["PaperCitation"]] = relationship(
+        back_populates="paper", cascade="all, delete-orphan"
+    )
 
 
 class Chunk(Base):
@@ -87,9 +90,21 @@ class Chunk(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     char_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     char_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     paper: Mapped[Paper] = relationship(back_populates="chunks")
+
+
+class PaperCitation(Base):
+    """An explicit arXiv reference from one paper to another (which may not be ingested yet)."""
+
+    __tablename__ = "paper_citations"
+
+    source_id: Mapped[str] = mapped_column(ForeignKey("papers.id"), primary_key=True)
+    target_arxiv_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+    paper: Mapped[Paper] = relationship(back_populates="citations")
 
 
 class CriteriaVersion(Base):
