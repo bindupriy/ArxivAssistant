@@ -23,12 +23,14 @@ assistant/
     app.py           # localhost FastAPI routes + SPA serving
     runner.py        # graph streaming + bounded concurrent in-memory jobs
     api_client.py    # loopback-only HTTP client for optional Streamlit UI
-  streamlit_app.py   # optional Streamlit frontend; uses FastAPI, not embedded stores
     static/          # generated Vite build; gitignored
+  streamlit_app.py   # optional Streamlit frontend; uses FastAPI, not embedded stores
 
-  agents/            # One file per node — all are real, some stubs are intentional
+  agents/            # All nine nodes are real; QA also has supporting modules
     orchestrator.py  # intent dispatch
     qa.py            # claim generation + evidence verification; low-conf info_gatherer detour
+    qa_schemas.py    # strict claim/evidence/verdict Pydantic contracts
+    qa_prompts.py    # generator and independent citation-verifier system prompts
     retrieval.py     # vanilla vs agentic, paper/topic/metadata scope, query rewrite
     curator.py       # per-topic LLM judge; preserves accepted and rejected results
     ingestion.py     # delegates to rag.ingest.ingest_source

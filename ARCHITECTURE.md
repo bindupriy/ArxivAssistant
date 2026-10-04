@@ -145,6 +145,11 @@ When enabled, `rag/compress.py` extracts bounded contiguous windows from each re
 
 ### Claim attribution
 
+`agents/qa_schemas.py` owns the strict generator/verification Pydantic contracts,
+and `agents/qa_prompts.py` owns their system prompts. The QA node in
+`agents/qa.py` keeps the retrieval, validation, fail-closed citation checks, and
+rendering logic. These support modules are not additional LangGraph nodes.
+
 1. The `qa` model returns a validated JSON draft: `claims` with single-line Markdown `text` and `evidence` entries (`source`, `quote`), plus `confidence`. It may use general knowledge with an empty evidence list; no chunks is not an automatic refusal. The prompt forbids invented paper-specific findings.
 2. Candidate evidence must name an existing retrieved source and contain an exact quote found in both the displayed context (when compressed) and the original chunk after whitespace normalization. Nonexistent sources and fabricated quotations are discarded before verification.
 3. One separate chat call batches remaining claim/quote/passage candidates. The `citation_verifier` role (or `qa` if absent) judges whether each quoted passage supports the entire associated claim, rejecting mere topic overlap, partial support, and unsupported qualifications or numbers. Malformed, incomplete, duplicate, or failed verification responses withhold citations.
